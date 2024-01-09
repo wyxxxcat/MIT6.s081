@@ -16,7 +16,6 @@ int main(int argc, char **argv)
         char buf;
         read(ppFa[0], &buf, 1);
         printf("%d: received pong\n", getpid());
-        wait(0);
     }
     else
     { // Son
