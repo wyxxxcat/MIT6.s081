@@ -1,11 +1,10 @@
-#include "param.h"
 #include "types.h"
+#include "param.h"
 #include "memlayout.h"
-#include "elf.h"
 #include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
 #include "defs.h"
-#include "fs.h"
-
 /*
  * the kernel's page table.
  */
@@ -478,4 +477,91 @@ void vmprint(pagetable_t pagetable, int dp)
       }
     }
   }
+}
+
+void ukvmmap(pagetable_t kpagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if (mappages(kpagetable, va, sz, pa, perm) != 0)
+    panic("ukvmmap");
+}
+
+pagetable_t
+ukvminit()
+{
+  pagetable_t kpagetable = (pagetable_t)kalloc();
+  if (kpagetable == 0)
+  {
+    return kpagetable;
+  }
+  memset(kpagetable, 0, PGSIZE);
+  // 把固定的常数映射照旧搬运过来
+  // uart registers
+  ukvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interface
+  ukvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // CLINT
+  ukvmmap(kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // PLIC
+  ukvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  // map kernel text executable and read-only.
+  ukvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+  // map kernel data and the physical RAM we'll make use of.
+  ukvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  ukvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return kpagetable;
+}
+void ukvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if ((va % PGSIZE) != 0)
+    panic("ukvmunmap: not aligned");
+
+  for (a = va; a < va + npages * PGSIZE; a += PGSIZE)
+  {
+    if ((pte = walk(pagetable, a, 0)) == 0)
+      goto clean;
+    if ((*pte & PTE_V) == 0)
+      goto clean;
+    if (PTE_FLAGS(*pte) == PTE_V)
+      panic("ukvmunmap: not a leaf");
+
+  clean:
+    *pte = 0;
+  }
+}
+void ufreewalk(pagetable_t pagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0)
+    {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      ufreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    pagetable[i] = 0;
+  }
+  kfree((void *)pagetable);
+}
+void freeprockvm(struct proc *p)
+{
+  pagetable_t kpagetable = p->kpagetable;
+  // reverse order of allocation
+  // 按分配顺序的逆序来销毁映射, 但不回收物理地址
+  ukvmunmap(kpagetable, p->kstack, PGSIZE / PGSIZE);
+  ukvmunmap(kpagetable, TRAMPOLINE, PGSIZE / PGSIZE);
+  ukvmunmap(kpagetable, (uint64)etext, (PHYSTOP - (uint64)etext) / PGSIZE);
+  ukvmunmap(kpagetable, KERNBASE, ((uint64)etext - KERNBASE) / PGSIZE);
+  ukvmunmap(kpagetable, PLIC, 0x400000 / PGSIZE);
+  ukvmunmap(kpagetable, CLINT, 0x10000 / PGSIZE);
+  ukvmunmap(kpagetable, VIRTIO0, PGSIZE / PGSIZE);
+  ukvmunmap(kpagetable, UART0, PGSIZE / PGSIZE);
+  ufreewalk(kpagetable);
 }
